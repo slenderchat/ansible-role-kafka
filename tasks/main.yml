@@ -1,0 +1,31 @@
+---
+# Phases run in this order on the whole kafka group. The play uses the linear
+# strategy and any_errors_fatal, so no host reaches a mutating phase unless
+# every host has passed all read-only phases.
+
+# Validates execution settings, platform requirements and inventory variables.
+- name: Check execution settings and variables
+  ansible.builtin.import_tasks: preflight.yml
+
+# Collects package, service, ownership and storage facts without changing hosts.
+- name: Inspect existing Kafka state (read-only)
+  ansible.builtin.import_tasks: inspect.yml
+
+# Classifies every host and selects initialization or configuration only when
+# the entire group is in a supported, consistent state.
+- name: Validate cluster ownership across the group (read-only)
+  ansible.builtin.import_tasks: validate.yml
+
+# Applies the package, directories, configuration and service units after
+# group validation succeeds.
+- name: Install and configure Kafka
+  ansible.builtin.import_tasks: configure.yml
+
+# Formats storage and writes ownership records only for an all-clean group.
+- name: Initialize a new cluster
+  ansible.builtin.import_tasks: initialize.yml
+  when: _kafka_action == 'initialize'
+
+# Starts stopped nodes, checks readiness and performs required rolling restarts.
+- name: Start and restart Kafka
+  ansible.builtin.import_tasks: service.yml

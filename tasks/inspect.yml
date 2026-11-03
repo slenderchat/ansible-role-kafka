@@ -1,0 +1,250 @@
+---
+# Read-only inspection of the host. Nothing here changes the host.
+# Each section reads one part of the host state and turns it into the facts
+# used by validate.yml, next to the task that produced the input.
+
+# --- Package ---------------------------------------------------------------
+
+# rc 1 means the package is not installed, which is a valid clean state.
+- name: Read installed Kafka package version
+  ansible.builtin.command: rpm -q --queryformat '%{VERSION}-%{RELEASE}' {{ kafka_package_name }}
+  environment:
+    LC_ALL: C
+  register: _kafka_rpm_query
+  changed_when: false
+  failed_when: _kafka_rpm_query.rc not in [0, 1]
+
+# An empty version stands for "not installed"; rpm prints a message instead of
+# a version in that case.
+- name: Record installed Kafka package version
+  ansible.builtin.set_fact:
+    _kafka_installed_version: "{{ _kafka_rpm_query.stdout | trim if _kafka_rpm_query.rc == 0 else '' }}"
+
+# Detects local edits of packaged files; rc 1 only means that differences exist.
+- name: Verify package files against the RPM database
+  ansible.builtin.command: rpm -V {{ kafka_package_name }}
+  environment:
+    LC_ALL: C
+  register: _kafka_rpm_verify
+  changed_when: false
+  failed_when: _kafka_rpm_verify.rc not in [0, 1]
+  when: _kafka_rpm_query.rc == 0
+
+# Only the configuration and unit files written by this role matter for
+# classification. "rpm -V" prints one line per changed file, ending with the
+# file path; no output is available when the package is not installed.
+- name: Select modified package files that the role manages
+  ansible.builtin.set_fact:
+    _kafka_modified_managed_files: >-
+      {{ _kafka_rpm_verify.stdout_lines | default([])
+         | select | map('split') | map('last')
+         | select('in', [kafka_config_file, kafka_unit_file])
+         | list }}
+
+# Without the package, files at the configured paths cannot belong to the RPM
+# and are traces of an earlier installation; rpm -V covers the installed case.
+- name: Check configured Kafka files when the package is absent
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+    get_mime: false
+  loop:
+    - "{{ kafka_config_file }}"
+    - "{{ kafka_unit_file }}"
+  register: _kafka_residual_stat
+  when: _kafka_rpm_query.rc == 1
+
+# Symlinks count as existing files. Always a list, empty when the package is
+# installed.
+- name: Select configured Kafka files present without the package
+  ansible.builtin.set_fact:
+    _kafka_residual_files: >-
+      {{ _kafka_residual_stat.results | selectattr('stat.exists') | map(attribute='item') | list
+         if _kafka_rpm_query.rc == 1 else [] }}
+
+# --- Services and processes ------------------------------------------------
+
+# ActiveState and UnitFileState classify the host, NeedDaemonReload drives the
+# daemon reload in configure.yml and ExecMainStartTimestamp is compared with
+# file modification times to detect a pending restart. "us+utc" keeps
+# microseconds and avoids local time zones; LC_ALL=C keeps the weekday ASCII.
+- name: Read Kafka systemd unit state
+  ansible.builtin.command: >-
+    systemctl show kafka.service --timestamp=us+utc
+    --property=ActiveState,UnitFileState,DropInPaths,ExecMainStartTimestamp,NeedDaemonReload
+  environment:
+    LC_ALL: C
+  register: _kafka_systemctl_show
+  changed_when: false
+
+# Turns "Name=value" lines into a mapping keyed by property name.
+- name: Parse Kafka systemd unit state
+  ansible.builtin.set_fact:
+    _kafka_unit: "{{ dict(_kafka_systemctl_show.stdout | regex_findall('(?m)^(\\w+)=(.*)$')) }}"
+
+# The restart decision for an active service depends on its start time, so a
+# missing or unexpected value stops the play instead of being taken as zero.
+- name: Require a parsable start time for an active Kafka service
+  ansible.builtin.assert:
+    that:
+      - "_kafka_unit.ExecMainStartTimestamp | default('') is match('^[A-Za-z]+ [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{6} UTC$')"
+    fail_msg: >-
+      {{ inventory_hostname }}: kafka.service is active, but its
+      ExecMainStartTimestamp "{{ _kafka_unit.ExecMainStartTimestamp | default('') }}"
+      is missing or not in the expected format. No changes made.
+    quiet: true
+  when: _kafka_unit.ActiveState | default('') == 'active'
+
+# Microseconds since the Unix epoch, computed from the UTC timestamp without
+# floating point. set_fact may store the result as a string; consumers
+# convert it explicitly.
+- name: Parse Kafka main process start time
+  ansible.builtin.set_fact:
+    _kafka_main_start_us: >-
+      {%- set started = _kafka_unit.ExecMainStartTimestamp | regex_replace('^[A-Za-z]+ ', '')
+                        | to_datetime('%Y-%m-%d %H:%M:%S.%f UTC') -%}
+      {%- set elapsed = started - ('1970-01-01 00:00:00' | to_datetime) -%}
+      {{ (elapsed.days * 86400 + elapsed.seconds) * 1000000 + elapsed.microseconds }}
+  when: _kafka_unit.ActiveState | default('') == 'active'
+
+# Distribution-wide drop-ins such as /usr/lib/systemd/system/service.d/*.conf
+# apply to every service and are not evidence of a local Kafka setup.
+- name: Select Kafka-specific systemd drop-ins
+  ansible.builtin.set_fact:
+    _kafka_unit_dropins: "{{ (_kafka_unit.DropInPaths | default('')).split() | select('search', '/kafka[.]service[.]d/') | list }}"
+
+# ZooKeeper state contributes to clean-host classification; managed hosts
+# are reconciled later by stopping, disabling and masking the service.
+# LoadState distinguishes the loaded definition from the desired mask.
+# NeedDaemonReload is not used: on the tested systemd 253 it remains "yes"
+# for a loaded mask and does not reliably identify a pending mask reload.
+- name: Read packaged ZooKeeper unit state
+  ansible.builtin.command: systemctl show zookeeper.service --property=ActiveState,UnitFileState,LoadState
+  register: _kafka_zookeeper_show
+  changed_when: false
+
+# Same "Name=value" format as the Kafka unit state.
+- name: Parse packaged ZooKeeper unit state
+  ansible.builtin.set_fact:
+    _kafka_zookeeper: "{{ dict(_kafka_zookeeper_show.stdout | regex_findall('(?m)^(\\w+)=(.*)$')) }}"
+
+# Detects Kafka server processes for comparison with kafka.service state.
+# rc 1 means no matching process was found.
+- name: Look for running Kafka server processes
+  ansible.builtin.command: pgrep -f 'java.* kafka\.Kafka '
+  register: _kafka_pgrep
+  changed_when: false
+  failed_when: _kafka_pgrep.rc not in [0, 1]
+
+# Reduces the pgrep result to a boolean for validate.yml.
+- name: Record whether a Kafka server process is running
+  ansible.builtin.set_fact:
+    _kafka_process_running: "{{ _kafka_pgrep.rc == 0 }}"
+
+# --- Ownership record ------------------------------------------------------
+
+# Presence alone prevents a host from being treated as clean.
+- name: Check role ownership record
+  ansible.builtin.stat:
+    path: "{{ kafka_owner_record }}"
+    get_checksum: false
+    get_mime: false
+  register: _kafka_record_stat
+
+# An unreadable record fails here, before any change.
+- name: Read role ownership record
+  ansible.builtin.slurp:
+    src: "{{ kafka_owner_record }}"
+  register: _kafka_record_slurp
+  when: _kafka_record_stat.stat.exists
+
+# Invalid JSON fails here, before any change. Records with an unexpected
+# structure are reported by validate.yml.
+- name: Parse role ownership record
+  ansible.builtin.set_fact:
+    _kafka_record_exists: "{{ _kafka_record_stat.stat.exists }}"
+    _kafka_record: >-
+      {{ _kafka_record_slurp.content | b64decode | from_json
+         if _kafka_record_stat.stat.exists else {} }}
+
+# --- Data directory and storage metadata -----------------------------------
+
+# Symlinks are not followed, so a link in place of the directory is reported
+# as an existing path that is not a directory.
+- name: Check Kafka data directory
+  ansible.builtin.stat:
+    path: "{{ kafka_data_dir }}"
+    get_checksum: false
+    get_mime: false
+  register: _kafka_data_stat
+
+# isdir is returned only for existing paths.
+- name: Record Kafka data directory type
+  ansible.builtin.set_fact:
+    _kafka_data_exists: "{{ _kafka_data_stat.stat.exists }}"
+    _kafka_data_isdir: "{{ _kafka_data_stat.stat.isdir | default(false) }}"
+
+# Hidden entries count as content, so a directory holding only dotfiles is
+# not taken for empty.
+- name: List Kafka data directory contents
+  ansible.builtin.find:
+    paths: "{{ kafka_data_dir }}"
+    file_type: any
+    hidden: true
+    recurse: false
+  register: _kafka_data_find
+  when: _kafka_data_isdir
+
+# find reports paths it could not read in skipped_paths instead of failing.
+# An incomplete listing must not be taken for an empty directory, so it stops
+# the play before any change.
+- name: Require a complete listing of the Kafka data directory
+  ansible.builtin.assert:
+    that:
+      - _kafka_data_find is not skipped
+      - _kafka_data_find.skipped_paths is defined
+      - _kafka_data_find.matched is defined
+      - _kafka_data_find.skipped_paths | length == 0
+    fail_msg: >-
+      {{ inventory_hostname }}: could not inspect {{ kafka_data_dir }}:
+      {{ _kafka_data_find.skipped_paths | default('listing was skipped') }}.
+      No changes made.
+    quiet: true
+  when: _kafka_data_isdir
+
+# A missing or non-directory path has no entries to count.
+- name: Count entries in the Kafka data directory
+  ansible.builtin.set_fact:
+    _kafka_data_entries: "{{ _kafka_data_find.matched | int if _kafka_data_isdir else 0 }}"
+
+# meta.properties is written by "kafka-storage.sh format" and identifies the
+# cluster and node that own the storage.
+- name: Check storage metadata file
+  ansible.builtin.stat:
+    path: "{{ kafka_data_dir }}/meta.properties"
+    get_checksum: false
+    get_mime: false
+  register: _kafka_meta_stat
+  when: _kafka_data_isdir
+
+# Kept apart from the parsed content: an empty or malformed file parses to a
+# mapping without identities, which must differ from an absent file.
+- name: Record whether storage metadata exists
+  ansible.builtin.set_fact:
+    _kafka_meta_exists: "{{ _kafka_meta_stat.stat.exists | default(false) }}"
+
+# An unreadable metadata file fails here, before any change.
+- name: Read storage metadata file
+  ansible.builtin.slurp:
+    src: "{{ kafka_data_dir }}/meta.properties"
+  register: _kafka_meta_slurp
+  when: _kafka_meta_exists
+
+# Java properties "key=value" lines; comments and other lines are ignored.
+# Always a mapping, empty when the file is absent.
+- name: Parse storage metadata file
+  ansible.builtin.set_fact:
+    _kafka_meta: >-
+      {{ dict(_kafka_meta_slurp.content | b64decode
+              | regex_findall('(?m)^[ \t]*([A-Za-z0-9._-]+)[ \t]*=[ \t]*(.*?)[ \t]*$'))
+         if _kafka_meta_exists else {} }}

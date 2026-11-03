@@ -1,0 +1,64 @@
+---
+# Stopped nodes (including every node of a new cluster) are started by one task
+# on all hosts before any readiness check runs, so no node waits for quorum
+# before the others have been started. Running nodes with changed
+# configuration are restarted one at a time, in node ID order, and each must
+# rejoin before the next one restarts. No handlers are used.
+
+# A file newer than the running process reveals changes written by an earlier
+# run that was interrupted before restarting this node.
+- name: Read modification times of the Kafka configuration and unit
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop:
+    - "{{ kafka_config_file }}"
+    - "{{ kafka_unit_file }}"
+  register: _kafka_managed_files
+
+# Uses the service state captured during inspection: a node that was active
+# needs a restart when a template changed in this run or a managed file is
+# newer than the process start. Both times are compared as whole microseconds
+# since the epoch; the start time of an active node was validated during
+# inspection. Stopped nodes are left to the start task.
+- name: Decide which running nodes need a restart
+  ansible.builtin.set_fact:
+    _kafka_needs_restart: >-
+      {{ _kafka_unit.ActiveState | default('') == 'active'
+         and (_kafka_config_result is changed or _kafka_unit_result is changed
+              or ((_kafka_managed_files.results | map(attribute='stat.mtime') | max) * 1000000) | int
+                 > _kafka_main_start_us | int) }}
+
+# Boot-time enablement only; the running state is handled by the next tasks.
+- name: Enable Kafka service
+  ansible.builtin.systemd:
+    name: kafka.service
+    enabled: true
+
+# Already running services are left running. The task completes on every host
+# before any readiness check begins.
+- name: Start stopped Kafka nodes
+  ansible.builtin.systemd:
+    name: kafka.service
+    state: started
+  register: _kafka_start
+
+# Readiness is checked only on hosts where the start task reported a change.
+- name: Wait for started nodes to join the cluster
+  ansible.builtin.include_tasks: wait_node.yml
+  when: _kafka_start is changed
+
+# When any participant needs a restart, every host runs the readiness checks
+# first; a host that does not pass them fails the play before any restart.
+- name: Check that every node is healthy before rolling restart
+  ansible.builtin.include_tasks: wait_node.yml
+  when: groups['kafka'] | map('extract', hostvars, '_kafka_needs_restart') | select | list | length > 0
+
+# Hosts are visited in node ID order and only flagged hosts are selected;
+# restart_node.yml restarts the selected node and waits for it to rejoin.
+- name: Restart nodes one at a time
+  ansible.builtin.include_tasks: restart_node.yml
+  loop: "{{ _kafka_hosts_by_node_id }}"
+  loop_control:
+    loop_var: _kafka_restart_host
+  when: hostvars[_kafka_restart_host]._kafka_needs_restart

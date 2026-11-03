@@ -1,0 +1,19 @@
+---
+# Fixed role constants. Not intended to be overridden.
+# Required inventory variables (no defaults):
+#   kafka_cluster_id - group_vars, shared 22-character Kafka cluster ID
+#   kafka_node_id    - host_vars, stable unique non-negative integer
+
+kafka_package_name: apache-kafka
+kafka_package_version: 3.9.1-1.red80
+
+kafka_broker_port: 9092
+kafka_controller_port: 9093
+
+kafka_home: /opt/kafka
+kafka_log_dir: /opt/kafka/logs
+kafka_config_file: /opt/kafka/config/server.properties
+kafka_unit_file: /etc/systemd/system/kafka.service
+kafka_state_dir: /var/lib/kafka
+kafka_data_dir: /var/lib/kafka/data
+kafka_owner_record: /var/lib/kafka/ansible-kafka-owner.json

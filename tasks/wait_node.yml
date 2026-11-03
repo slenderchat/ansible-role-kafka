@@ -1,0 +1,79 @@
+---
+# Read-only readiness checks of the current node. Port checks wait for a TCP
+# connection up to their timeout; command checks are retried a fixed number of
+# times with a delay, so their total duration also depends on how long each
+# command runs. A check that does not succeed fails the host, and
+# any_errors_fatal stops the play.
+
+# Both local listeners must accept TCP connections before the Kafka CLI checks
+# run against them; open ports alone do not mean the node is ready.
+- name: Wait for this node's Kafka ports
+  ansible.builtin.wait_for:
+    host: "{{ ansible_default_ipv4.address }}"
+    port: "{{ item }}"
+    timeout: 300
+  loop:
+    - "{{ kafka_controller_port }}"
+    - "{{ kafka_broker_port }}"
+
+# Checks both ports on every group member, including this host. The group's
+# start task precedes all readiness checks, so peers are already started or
+# running and a short timeout per endpoint keeps diagnostics prompt; the loop
+# still visits every endpoint before the task fails.
+- name: Check that Kafka ports of every group member are reachable from this node
+  ansible.builtin.wait_for:
+    host: "{{ hostvars[item.0].ansible_default_ipv4.address }}"
+    port: "{{ item.1 }}"
+    timeout: 60
+    msg: >-
+      Kafka connectivity check failed: no TCP connection from
+      {{ inventory_hostname }} ({{ ansible_default_ipv4.address }}) to
+      {{ item.0 }} ({{ hostvars[item.0].ansible_default_ipv4.address }})
+      port {{ item.1 }} within 60 seconds. Every kafka host must reach TCP
+      {{ kafka_broker_port }} and {{ kafka_controller_port }} on every other
+      kafka host.
+  loop: "{{ _kafka_hosts_by_node_id | product([kafka_controller_port, kafka_broker_port]) | list }}"
+  loop_control:
+    label: "{{ item.0 }}:{{ item.1 }}"
+
+# The replication table must list this node ID as Leader or Follower with a
+# reported lag of 0.
+- name: Wait for node to be a caught-up quorum voter
+  ansible.builtin.command: >-
+    {{ kafka_home }}/bin/kafka-metadata-quorum.sh
+    --bootstrap-server {{ ansible_default_ipv4.address }}:{{ kafka_broker_port }}
+    describe --replication
+  register: _kafka_quorum
+  changed_when: false
+  until: >-
+    _kafka_quorum.rc == 0 and
+    _kafka_quorum.stdout is search('(?m)^' ~ kafka_node_id ~ '\s+\S+\s+\d+\s+0\s+\S+\s+\S+\s+(Leader|Follower)\s*$')
+  retries: 36
+  delay: 5
+
+# The command must succeed and its broker list must contain an entry with this
+# node ID.
+- name: Wait for this node ID to appear in the broker list
+  ansible.builtin.command: >-
+    {{ kafka_home }}/bin/kafka-broker-api-versions.sh
+    --bootstrap-server {{ ansible_default_ipv4.address }}:{{ kafka_broker_port }}
+  register: _kafka_brokers
+  changed_when: false
+  until: >-
+    _kafka_brokers.rc == 0 and
+    _kafka_brokers.stdout is search('\(id: ' ~ kafka_node_id ~ ' rack: ')
+  retries: 36
+  delay: 5
+
+# The command must succeed and report no under-replicated partition entries;
+# a cluster without topics also gives an empty result.
+- name: Wait until no partitions are under-replicated
+  ansible.builtin.command: >-
+    {{ kafka_home }}/bin/kafka-topics.sh
+    --bootstrap-server {{ ansible_default_ipv4.address }}:{{ kafka_broker_port }}
+    --describe --under-replicated-partitions
+  register: _kafka_urp
+  changed_when: false
+  until: _kafka_urp.rc == 0 and _kafka_urp.stdout | trim == ''
+  retries: 60
+  delay: 5

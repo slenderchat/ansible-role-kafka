@@ -1,0 +1,41 @@
+---
+# Runs only when every host of the group was classified clean.
+# kafka-storage.sh refuses to format an already formatted directory;
+# --ignore-formatted is intentionally not used.
+
+# The cluster ID is passed as a single "--cluster-id=<value>" argument, so a
+# valid ID that starts with "-" is not parsed as an option.
+- name: Format Kafka storage with the supplied cluster ID
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - kafka
+      - --
+      - "{{ kafka_home }}/bin/kafka-storage.sh"
+      - format
+      - "--cluster-id={{ kafka_cluster_id }}"
+      - "--config={{ kafka_config_file }}"
+  changed_when: true
+
+# Written only after formatting on this host succeeded; it records the cluster
+# and node identity, storage path and controller voters. Later runs compare it
+# with the variables to validate ownership and consistency. force: false keeps
+# an existing record instead of overwriting it.
+- name: Write role ownership record
+  ansible.builtin.copy:
+    dest: "{{ kafka_owner_record }}"
+    content: "{{ _record | to_nice_json }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+    force: false
+  vars:
+    _record:
+      managed_by: ansible-role-kafka
+      cluster_id: "{{ kafka_cluster_id }}"
+      node_id: "{{ kafka_node_id }}"
+      log_dirs:
+        - "{{ kafka_data_dir }}"
+      quorum_voters: "{{ _kafka_quorum_voters }}"
+      initialized_at: "{{ ansible_date_time.iso8601 }}"

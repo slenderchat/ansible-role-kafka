@@ -1,0 +1,107 @@
+---
+# Last guard before the first change: requires the group action selected by
+# validate.yml and every kafka host still active. Inspection is not repeated.
+- name: Confirm group validation before changing hosts
+  ansible.builtin.assert:
+    that:
+      - _kafka_action | default('') in ['initialize', 'apply']
+      - ansible_play_hosts | sort == groups['kafka'] | sort
+    fail_msg: Group validation did not complete for every kafka host; no changes made.
+    quiet: true
+
+# Only the fixed version is requested; validation has already refused hosts
+# with a different installed version.
+- name: Install Kafka package
+  ansible.builtin.dnf:
+    name: "{{ kafka_package_name }}-{{ kafka_package_version }}"
+    state: present
+
+# Holds the ownership record; owned by root so the kafka user cannot modify it.
+- name: Create Kafka state directory
+  ansible.builtin.file:
+    path: "{{ kafka_state_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+# Kafka owns the storage; its group has read/search access and others have none.
+# Clean-host validation requires this path to be absent or an empty directory.
+- name: Create Kafka data directory
+  ansible.builtin.file:
+    path: "{{ kafka_data_dir }}"
+    state: directory
+    owner: kafka
+    group: kafka
+    mode: "0750"
+
+# Package default LOG_DIR; created here so that CLI tools run as root
+# cannot create it with the wrong owner before the service does.
+- name: Create Kafka log directory
+  ansible.builtin.file:
+    path: "{{ kafka_log_dir }}"
+    state: directory
+    owner: kafka
+    group: kafka
+    mode: "0755"
+
+# Readable by the kafka group, writable only by root. A running broker picks up
+# changes only after a restart; the registered result feeds the restart
+# decision in service.yml.
+- name: Configure Kafka server
+  ansible.builtin.template:
+    src: server.properties.j2
+    dest: "{{ kafka_config_file }}"
+    owner: root
+    group: kafka
+    mode: "0640"
+  register: _kafka_config_result
+
+# The packaged unit requires zookeeper.service. Dependencies cannot be removed
+# with a drop-in, so the packaged unit file itself is replaced. The registered
+# result drives the daemon reload and the restart decision.
+- name: Configure Kafka systemd unit
+  ansible.builtin.template:
+    src: kafka.service.j2
+    dest: "{{ kafka_unit_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: _kafka_unit_result
+
+# Also runs when inspection found the unit file changed on disk but not yet
+# loaded (NeedDaemonReload), for example after an interrupted run.
+- name: Reload systemd after unit change
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: _kafka_unit_result is changed or _kafka_unit.NeedDaemonReload | default('no') == 'yes'
+
+# Reinstalling the RPM restores the packaged kafka.service, whose
+# Requires= starts zookeeper.service. Stopped only after the KRaft unit is
+# loaded, because stopping a required unit would also stop Kafka. Disabled
+# before masking, so that no enablement links remain.
+- name: Keep the packaged ZooKeeper service stopped and disabled
+  ansible.builtin.systemd:
+    name: zookeeper.service
+    state: stopped
+    enabled: false
+
+# The package installs zookeeper.service as a regular file in
+# /etc/systemd/system, where "systemctl mask" refuses to create its /dev/null
+# link. The packaged file is replaced with that link instead; a package
+# reinstallation restores the file and the next run masks it again.
+- name: Mask the packaged ZooKeeper service
+  ansible.builtin.file:
+    path: /etc/systemd/system/zookeeper.service
+    src: /dev/null
+    state: link
+    force: true
+  register: _kafka_zookeeper_mask
+
+# Reloads systemd when the mask changed or inspection found a loaded
+# ZooKeeper definition other than the mask. This also reconciles a mask
+# written by an earlier interrupted run.
+- name: Reload systemd after masking ZooKeeper
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: _kafka_zookeeper_mask is changed or _kafka_zookeeper.LoadState | default('') != 'masked'
