@@ -1,0 +1,37 @@
+# Ansible runtime artifacts
+*.retry
+.ansible/
+fact_cache/
+
+# Local inventories and run configuration
+/inventory*
+/host_vars/
+/group_vars/
+/ansible.cfg
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.orig
+*.swp
+*~
+
+# Generated archives
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
