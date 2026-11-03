@@ -1,0 +1,27 @@
+---
+# Included for each selected node in node ID order. With the linear strategy,
+# every host checks group participation; only the selected host restarts
+# Kafka and runs readiness checks.
+
+# Refuses the next restart if any group member has already failed or become
+# unreachable in this play; this does not actively probe host connectivity.
+- name: Require all kafka hosts to be still active before restarting {{ _kafka_restart_host }}
+  ansible.builtin.assert:
+    that:
+      - ansible_play_hosts | sort == groups['kafka'] | sort
+    fail_msg: >-
+      Not restarting {{ _kafka_restart_host }}: hosts no longer active in this run:
+      {{ groups['kafka'] | difference(ansible_play_hosts) }}.
+    quiet: true
+
+# Restarts Kafka only on the host selected by the outer loop.
+- name: Restart Kafka on {{ _kafka_restart_host }}
+  ansible.builtin.systemd:
+    name: kafka.service
+    state: restarted
+  when: inventory_hostname == _kafka_restart_host
+
+# The selected host must pass readiness checks before the outer loop advances.
+- name: Wait for {{ _kafka_restart_host }} to rejoin the cluster
+  ansible.builtin.include_tasks: wait_node.yml
+  when: inventory_hostname == _kafka_restart_host

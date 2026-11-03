@@ -1,0 +1,32 @@
+# {{ ansible_managed }}
+# Kafka {{ kafka_package_version }} in KRaft mode, combined broker and controller.
+
+process.roles=broker,controller
+node.id={{ kafka_node_id }}
+controller.quorum.voters={{ _kafka_quorum_voters }}
+
+listeners=PLAINTEXT://{{ ansible_default_ipv4.address }}:{{ kafka_broker_port }},CONTROLLER://{{ ansible_default_ipv4.address }}:{{ kafka_controller_port }}
+advertised.listeners=PLAINTEXT://{{ ansible_default_ipv4.address }}:{{ kafka_broker_port }}
+listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+controller.listener.names=CONTROLLER
+inter.broker.listener.name=PLAINTEXT
+
+log.dirs={{ kafka_data_dir }}
+
+num.network.threads=3
+num.io.threads=8
+socket.send.buffer.bytes=102400
+socket.receive.buffer.bytes=102400
+socket.request.max.bytes=104857600
+
+num.partitions=1
+num.recovery.threads.per.data.dir=1
+default.replication.factor={{ [3, groups['kafka'] | length] | min }}
+min.insync.replicas={{ [2, groups['kafka'] | length] | min }}
+offsets.topic.replication.factor={{ [3, groups['kafka'] | length] | min }}
+transaction.state.log.replication.factor={{ [3, groups['kafka'] | length] | min }}
+transaction.state.log.min.isr={{ [2, groups['kafka'] | length] | min }}
+
+log.retention.hours=168
+log.segment.bytes=1073741824
+log.retention.check.interval.ms=300000

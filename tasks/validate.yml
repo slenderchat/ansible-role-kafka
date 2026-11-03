@@ -1,0 +1,164 @@
+---
+# Read-only. Classifies each host, then decides one action for the whole group:
+#   initialize - every host is clean
+#   apply      - every host is owned by this role and consistent
+# Any other combination fails on all hosts before any change is made.
+
+# Node IDs are unique (checked in preflight.yml), so this gives one stable
+# order for controller voters, readiness checks and rolling restarts.
+- name: Order hosts by node ID
+  ansible.builtin.set_fact:
+    _kafka_hosts_by_node_id: >-
+      {{ dict(groups['kafka'] | map('extract', hostvars, 'kafka_node_id') | zip(groups['kafka']))
+         | dictsort | map('last') | list }}
+
+# The same "id@address:port" list is computed on every host; it is written to
+# server.properties and compared with the ownership record.
+- name: Build controller quorum voters
+  ansible.builtin.set_fact:
+    _kafka_quorum_voters: >-
+      {%- set voters = [] -%}
+      {%- for h in _kafka_hosts_by_node_id -%}
+      {%-   set _ = voters.append(hostvars[h].kafka_node_id | string ~ '@' ~ hostvars[h].ansible_default_ipv4.address ~ ':' ~ kafka_controller_port | string) -%}
+      {%- endfor -%}
+      {{ voters | join(',') }}
+
+# Each check is a condition ("found") and the reason reported when it holds.
+# A host is clean when no clean-host check finds anything.
+- name: Check whether this host is clean
+  ansible.builtin.set_fact:
+    _kafka_evidence: "{{ _checks | selectattr('found') | map(attribute='reason') | list }}"
+  vars:
+    _checks:
+      - found: "{{ _kafka_installed_version not in ['', kafka_package_version] }}"
+        reason: "installed {{ kafka_package_name }} {{ _kafka_installed_version }} differs from required {{ kafka_package_version }}"
+      - found: "{{ _kafka_modified_managed_files | length > 0 }}"
+        reason: "package files differ from RPM: {{ _kafka_modified_managed_files | join(' ') }}"
+      - found: "{{ _kafka_residual_files | length > 0 }}"
+        reason: "configured Kafka files exist without the {{ kafka_package_name }} package: {{ _kafka_residual_files | join(' ') }}"
+      - found: "{{ _kafka_unit.ActiveState | default('inactive') not in ['inactive', 'failed'] }}"
+        reason: "kafka.service is {{ _kafka_unit.ActiveState | default('') }}"
+      - found: "{{ _kafka_unit.UnitFileState | default('') == 'enabled' }}"
+        reason: kafka.service is enabled
+      - found: "{{ _kafka_unit_dropins | length > 0 }}"
+        reason: "kafka.service has drop-ins: {{ _kafka_unit_dropins | join(' ') }}"
+      # Stopped, disabled or masked ZooKeeper is accepted.
+      - found: >-
+          {{ _kafka_zookeeper.ActiveState | default('inactive') not in ['inactive', 'failed']
+             or _kafka_zookeeper.UnitFileState | default('') == 'enabled' }}
+        reason: "zookeeper.service is {{ _kafka_zookeeper.ActiveState | default('') }}/{{ _kafka_zookeeper.UnitFileState | default('') }}"
+      - found: "{{ _kafka_process_running }}"
+        reason: a Kafka server process is running
+      - found: "{{ _kafka_record_exists }}"
+        reason: "ownership record {{ kafka_owner_record }} exists"
+      - found: "{{ _kafka_data_exists and not _kafka_data_isdir }}"
+        reason: "storage path {{ kafka_data_dir }} is not a directory"
+      # set_fact may store the entry count as a string.
+      - found: "{{ _kafka_data_entries | int > 0 }}"
+        reason: "storage path {{ kafka_data_dir }} is not empty"
+
+# Deviations from a host initialized by this role with the current variables.
+# A host is role-managed when its record exists and no check finds anything.
+- name: Check whether this host is managed by this role and consistent
+  ansible.builtin.set_fact:
+    _kafka_problems: "{{ _checks | selectattr('found') | map(attribute='reason') | list }}"
+  vars:
+    _record: "{{ _kafka_record if _kafka_record is mapping else {} }}"
+    _checks:
+      - found: "{{ _kafka_record is not mapping }}"
+        reason: ownership record is not a JSON object
+      - found: "{{ _record.managed_by | default('') != 'ansible-role-kafka' }}"
+        reason: ownership record is missing or not written by this role
+      - found: "{{ _record.cluster_id | default('') != kafka_cluster_id }}"
+        reason: "recorded cluster ID {{ _record.cluster_id | default('none') }} differs from kafka_cluster_id {{ kafka_cluster_id }}"
+      # The integer test rejects booleans and floats that compare equal to an
+      # integer, such as true for 1 or 1.0 for 1.
+      - found: "{{ _record.node_id is not integer }}"
+        reason: "recorded node ID {{ _record.node_id | default('none') }} is missing or not an integer"
+      - found: "{{ _record.node_id is integer and _record.node_id != kafka_node_id }}"
+        reason: "recorded node ID {{ _record.node_id | default('none') }} differs from kafka_node_id {{ kafka_node_id }}"
+      - found: "{{ _record.log_dirs | default([]) != [kafka_data_dir] }}"
+        reason: "recorded storage paths {{ _record.log_dirs | default([]) }} differ from {{ [kafka_data_dir] }}"
+      - found: "{{ _record.quorum_voters | default('') != _kafka_quorum_voters }}"
+        reason: "recorded controller voters {{ _record.quorum_voters | default('none') }} differ from {{ _kafka_quorum_voters }}"
+      - found: "{{ _kafka_installed_version != kafka_package_version }}"
+        reason: "installed package version is {{ _kafka_installed_version or 'none' }}, required {{ kafka_package_version }}"
+      - found: "{{ _kafka_unit_dropins | length > 0 }}"
+        reason: "kafka.service has drop-ins: {{ _kafka_unit_dropins | join(' ') }}"
+      - found: "{{ _kafka_process_running and _kafka_unit.ActiveState | default('') != 'active' }}"
+        reason: a Kafka server process is running while kafka.service is not active
+      # Recorded paths that differ from kafka_data_dir are rejected above and
+      # are not inspected.
+      - found: "{{ not _kafka_data_isdir }}"
+        reason: "storage path {{ kafka_data_dir }} is missing or not a directory"
+      - found: "{{ _kafka_data_isdir and not _kafka_meta_exists }}"
+        reason: "storage path {{ kafka_data_dir }} has no meta.properties"
+      - found: >-
+          {{ _kafka_meta_exists
+             and (_kafka_meta['cluster.id'] | default('') != kafka_cluster_id
+                  or _kafka_meta['node.id'] | default('') != kafka_node_id | string) }}
+        reason: >-
+          meta.properties in {{ kafka_data_dir }} has
+          cluster.id={{ _kafka_meta['cluster.id'] | default('none') }}
+          node.id={{ _kafka_meta['node.id'] | default('none') }}
+
+# clean        - no evidence preventing initialization within the inspected scope
+# owned        - initialized by this role and consistent with the variables
+# inconsistent - role ownership record exists, but the host deviates from it
+# unowned      - Kafka traces without a record establishing role ownership
+- name: Record host state
+  ansible.builtin.set_fact:
+    _kafka_state: >-
+      {{ 'clean' if _kafka_evidence | length == 0
+         else 'owned' if _kafka_problems | length == 0
+         else 'inconsistent' if _kafka_record_exists
+         else 'unowned' }}
+
+# Details are added only for unowned and inconsistent hosts; the reports of all
+# hosts are joined into the group failure message.
+- name: Describe host state for group diagnostics
+  ansible.builtin.set_fact:
+    _kafka_state_report: >-
+      [{{ inventory_hostname }}: {{ _kafka_state }}
+      {%- if _kafka_state == 'unowned' %}; evidence: {{ _kafka_evidence | join('; ') }}{% endif %}
+      {%- if _kafka_state == 'inconsistent' %}; problems: {{ _kafka_problems | join('; ') }}{% endif %}]
+
+# Group-wide barrier before any change.
+# Failed or unreachable hosts leave ansible_play_hosts; any missing group
+# member prevents progression to the mutating phases.
+- name: Require every host of the kafka group to be inspected
+  ansible.builtin.assert:
+    that:
+      - ansible_play_hosts | sort == groups['kafka'] | sort
+    fail_msg: >-
+      Refusing to change any host: not inspected (unreachable or failed):
+      {{ groups['kafka'] | difference(ansible_play_hosts) | sort }}.
+    quiet: true
+
+# Only all-clean or all-owned groups may proceed. Mixed, inconsistent and
+# unowned groups are refused instead of being adopted or automatically repaired.
+- name: Require all hosts to be clean or all to be managed by this role
+  ansible.builtin.assert:
+    that:
+      - _states in [['clean'], ['owned']]
+    fail_msg: >-
+      Refusing to change any host. Supported group states: all hosts clean
+      (initialize a new cluster) or all hosts owned by this role and consistent
+      (apply configuration).
+      {{ _kafka_hosts_by_node_id | map('extract', hostvars, '_kafka_state_report') | join(' ') }}
+      The role does not adopt existing data, repair partial initialization,
+      or change cluster ID, node IDs, controller membership or storage paths.
+      Initial deployment is not atomic across hosts. If a first run stopped
+      after managed configuration files were written and before every host
+      was formatted and recorded, return all hosts to a clean state (no data,
+      record, modified package files or configuration files left without the
+      package) and rerun.
+    quiet: true
+  vars:
+    _states: "{{ groups['kafka'] | map('extract', hostvars, '_kafka_state') | unique | list }}"
+
+# After the barrier all hosts share one state, so every host selects the same
+# action; initialize.yml runs only for "initialize".
+- name: Select group action
+  ansible.builtin.set_fact:
+    _kafka_action: "{{ 'initialize' if _kafka_state == 'clean' else 'apply' }}"

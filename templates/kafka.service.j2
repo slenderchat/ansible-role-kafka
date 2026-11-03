@@ -1,0 +1,20 @@
+# {{ ansible_managed }}
+# Replaces the packaged unit, which requires zookeeper.service.
+[Unit]
+Description=Apache Kafka (KRaft)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=kafka
+Group=kafka
+ExecStart={{ kafka_home }}/bin/kafka-server-start.sh {{ kafka_config_file }}
+# The JVM exits with 143 after SIGTERM on a normal stop.
+SuccessExitStatus=143
+TimeoutStopSec=180
+Restart=on-failure
+LimitNOFILE=100000
+
+[Install]
+WantedBy=multi-user.target

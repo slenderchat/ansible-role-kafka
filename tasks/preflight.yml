@@ -1,0 +1,85 @@
+---
+# Read-only checks. Every host evaluates the group-wide conditions itself, so a
+# failure fails all hosts and any_errors_fatal stops the play.
+
+# Group-wide classification and quorum configuration need every kafka host in
+# one batch. Check mode and tag filtering would skip parts of the read-only
+# phases that later phases depend on.
+- name: Require full-group execution with supported settings
+  ansible.builtin.assert:
+    that:
+      - groups['kafka'] is defined
+      - groups['kafka'] | length > 0
+      - ansible_play_hosts_all | sort == groups['kafka'] | sort
+      - ansible_play_batch | sort == groups['kafka'] | sort
+      - not ansible_check_mode
+      - ansible_run_tags == ['all']
+      - ansible_skip_tags | length == 0
+    fail_msg: >-
+      This role supports only a full run of kafka.yml on the whole 'kafka' group
+      without --limit, --check, --tags or --skip-tags.
+      kafka group: {{ groups['kafka'] | default([]) | sort }};
+      play hosts: {{ ansible_play_hosts_all | sort }};
+      current batch: {{ ansible_play_batch | sort }};
+      check mode: {{ ansible_check_mode }};
+      tags: {{ ansible_run_tags }}; skip tags: {{ ansible_skip_tags }}.
+    quiet: true
+
+# The fixed package version is built for RED OS 8, which reports its
+# distribution as either RED or REDOS. The default IPv4 address is used for
+# listeners and controller quorum voters.
+- name: Require RED OS 8 and an IPv4 default route
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution in ['RED', 'REDOS']
+      - ansible_distribution_major_version == '8'
+      - ansible_service_mgr == 'systemd'
+      - ansible_default_ipv4.address is defined
+    fail_msg: >-
+      {{ inventory_hostname }}: expected RED OS 8 with systemd and a default IPv4
+      route; found {{ ansible_distribution }} {{ ansible_distribution_version }},
+      service manager {{ ansible_service_mgr }},
+      default IPv4 address {{ ansible_default_ipv4.address | default('none') }}.
+    quiet: true
+
+# The role never generates a cluster ID. Node IDs are limited to the Kafka
+# int32 range; cluster IDs must have the 22-character base64url form printed by
+# "kafka-storage.sh random-uuid".
+- name: Validate this host's Kafka variables
+  ansible.builtin.assert:
+    that:
+      - kafka_node_id is defined
+      - kafka_node_id is integer
+      - kafka_node_id >= 0
+      - kafka_node_id <= 2147483647
+      - kafka_cluster_id is defined
+      - kafka_cluster_id is string
+      - kafka_cluster_id is match('^[A-Za-z0-9_-]{22}$')
+    fail_msg: >-
+      {{ inventory_hostname }}: kafka_node_id must be a non-negative integer set
+      in host_vars (got {{ kafka_node_id | default('undefined') }}), and
+      kafka_cluster_id must be a 22-character Kafka cluster ID set in group_vars
+      (got {{ kafka_cluster_id | default('undefined') }}). Generate a cluster ID
+      once, for example with 'kafka-storage.sh random-uuid'.
+    quiet: true
+
+# Each voter in controller.quorum.voters needs a distinct node ID and address,
+# and all nodes must belong to the same cluster. Cluster IDs are compared
+# case-sensitively, because the unique filter ignores case by default.
+- name: Validate Kafka variables across the group
+  ansible.builtin.assert:
+    that:
+      - _ids | unique | length == _ids | length
+      - _cluster_ids | unique(case_sensitive=true) | length == 1
+      - _addresses | unique | length == _addresses | length
+    fail_msg: >-
+      kafka_node_id and ansible_default_ipv4.address must be unique and
+      kafka_cluster_id must be identical on all hosts of the kafka group.
+      Node IDs: {{ dict(groups['kafka'] | zip(_ids)) }};
+      addresses: {{ dict(groups['kafka'] | zip(_addresses)) }};
+      cluster IDs: {{ _cluster_ids | unique(case_sensitive=true) }}.
+    quiet: true
+  vars:
+    _ids: "{{ groups['kafka'] | map('extract', hostvars, 'kafka_node_id') | list }}"
+    _cluster_ids: "{{ groups['kafka'] | map('extract', hostvars, 'kafka_cluster_id') | list }}"
+    _addresses: "{{ groups['kafka'] | map('extract', hostvars, ['ansible_default_ipv4', 'address']) | list }}"
